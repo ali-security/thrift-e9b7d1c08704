@@ -20,7 +20,10 @@
 package thrift
 
 import (
+	"bytes"
 	"compress/zlib"
+	"context"
+	"io"
 	"testing"
 )
 
@@ -59,4 +62,127 @@ func TestZlibFactoryTransportWithoutFactory(t *testing.T) {
 		t.Fatal(err)
 	}
 	TransportTest(t, trans, trans)
+}
+
+func TestZlibTransportMessageSizeLimit(t *testing.T) {
+	const dataSize = 4096
+	data := bytes.Repeat([]byte{'a'}, dataSize)
+
+	// Write and flush (not close) so TMemoryBuffer.Close() doesn't wipe the data.
+	writeBuf := NewTMemoryBuffer()
+	writer, err := NewTZlibTransport(writeBuf, zlib.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	compressed := make([]byte, writeBuf.Len())
+	copy(compressed, writeBuf.Bytes())
+
+	readBuf := NewTMemoryBuffer()
+	readBuf.Write(compressed)
+	reader, err := NewTZlibTransport(readBuf, zlib.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.SetTConfiguration(&TConfiguration{MaxMessageSize: 1024})
+
+	_, err = reader.Read(make([]byte, dataSize))
+	if err == nil {
+		t.Fatal("expected SIZE_LIMIT error, got nil")
+	}
+	protoEx, ok := err.(TProtocolException)
+	if !ok || protoEx.TypeId() != SIZE_LIMIT {
+		t.Fatalf("expected SIZE_LIMIT TProtocolException, got %T: %v", err, err)
+	}
+}
+
+// zlibCompressForTest compresses data through a TZlibTransport and returns a
+// fresh TMemoryBuffer holding the compressed bytes.
+func zlibCompressForTest(t *testing.T, data []byte) *TMemoryBuffer {
+	t.Helper()
+	// Write and flush (not close) so TMemoryBuffer.Close() doesn't wipe the data.
+	writeBuf := NewTMemoryBuffer()
+	writer, err := NewTZlibTransport(writeBuf, zlib.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	readBuf := NewTMemoryBuffer()
+	readBuf.Write(writeBuf.Bytes())
+	return readBuf
+}
+
+// TestZlibTransportDecompressionBombChunked feeds a highly compressible
+// payload that is read back in small chunks: every single Read stays below
+// MaxMessageSize, so only cumulative accounting of the decompressed bytes can
+// stop the amplification.
+func TestZlibTransportDecompressionBombChunked(t *testing.T) {
+	const (
+		maxSize   = 64 * 1024
+		chunkSize = 4096
+		bombSize  = 8 * 1024 * 1024
+	)
+
+	readBuf := zlibCompressForTest(t, make([]byte, bombSize))
+	if readBuf.Len() >= maxSize {
+		t.Fatalf("compressed payload is %d bytes, expected less than %d", readBuf.Len(), maxSize)
+	}
+
+	reader, err := NewTZlibTransport(readBuf, zlib.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.SetTConfiguration(&TConfiguration{MaxMessageSize: maxSize})
+
+	buf := make([]byte, chunkSize)
+	total := 0
+	for i := 0; i <= bombSize/chunkSize+1; i++ {
+		var n int
+		n, err = reader.Read(buf)
+		total += n
+		if err != nil {
+			break
+		}
+	}
+	if err == nil {
+		t.Fatalf("expected SIZE_LIMIT error, got nil after reading %d bytes", total)
+	}
+	protoEx, ok := err.(TProtocolException)
+	if !ok || protoEx.TypeId() != SIZE_LIMIT {
+		t.Fatalf("expected SIZE_LIMIT TProtocolException after reading %d bytes, got %T: %v", total, err, err)
+	}
+	if total > maxSize+chunkSize {
+		t.Fatalf("decompressed %d bytes before the limit was enforced, expected at most %d", total, maxSize+chunkSize)
+	}
+}
+
+// TestZlibTransportMessageSizeLimitWithinLimit ensures payloads that fit in
+// MaxMessageSize are still fully readable.
+func TestZlibTransportMessageSizeLimitWithinLimit(t *testing.T) {
+	const maxSize = 64 * 1024
+	data := bytes.Repeat([]byte{'a'}, maxSize)
+
+	reader, err := NewTZlibTransport(zlibCompressForTest(t, data), zlib.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.SetTConfiguration(&TConfiguration{MaxMessageSize: maxSize})
+
+	got := make([]byte, len(data))
+	if _, err := io.ReadFull(reader, got); err != nil {
+		t.Fatalf("unexpected error reading %d bytes within limit: %v", len(data), err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("decompressed data does not match the original payload")
+	}
 }
