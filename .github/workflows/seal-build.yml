@@ -1,0 +1,251 @@
+# sealed-libraries: fork build for the Go module github.com/apache/thrift.
+#
+# - Replays build.yml's `compiler` + `lib-go` jobs verbatim (compiler matrix
+#   reduced to ubuntu-24.04, the only leg whose output lib-go consumes).
+#   build.yml itself cannot be harvested by the sealing harness: its 76-leg
+#   polyglot matrix uploads artifacts with duplicate basenames.
+# - Adds the Windows Go test leg the sealed package requires.
+# - Packs the release artifact, the Go module zip, with golang.org/x/mod/zip.
+name: Seal Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go test -run regex to scope the Go tests; empty runs all"
+        required: false
+        default: ''
+        type: string
+
+env:
+  BUILD_DEPS: automake bison flex git libboost-all-dev libevent-dev libssl-dev libtool make pkg-config
+  CONFIG_ARGS_FOR_LIBS: >
+    --disable-debug
+    --disable-dependency-tracking
+    --without-cpp
+    --without-c_glib
+    --without-java
+    --without-kotlin
+    --without-python
+    --without-py3
+    --without-ruby
+    --without-haxe
+    --without-netstd
+    --without-perl
+    --without-php
+    --without-php_extension
+    --without-dart
+    --without-erlang
+    --without-go
+    --without-d
+    --without-nodejs
+    --without-nodets
+    --without-lua
+    --without-rs
+    --without-swift
+
+permissions:
+  contents: read
+
+jobs:
+  compiler:
+    strategy:
+      matrix:
+        os:
+          - ubuntu-24.04
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -yq
+          sudo apt-get install -y --no-install-recommends g++ $BUILD_DEPS
+
+      - name: Run bootstrap
+        run: ./bootstrap.sh
+
+      - name: Run configure
+        run: ./configure --disable-debug --disable-tests --disable-libs
+
+      - name: Run make
+        run: make -j$(nproc)
+
+      - name: Run install
+        run: make install
+
+      - name: Run thrift version
+        run: /usr/local/bin/thrift -version
+
+      - name: Test Delphi UUIDv8 GUID determinism
+        run: |
+          # Run the Delphi generator twice on the same input and verify identical output.
+          # Tests: cross-platform determinism, service inheritance, struct field-order.
+          THRIFT=/usr/local/bin/thrift
+          INPUT=test/delphi/UuidV8Test.thrift
+
+          mkdir -p /tmp/delphi-guid-run1 /tmp/delphi-guid-run2
+          $THRIFT --gen delphi --out /tmp/delphi-guid-run1 $INPUT
+          $THRIFT --gen delphi --out /tmp/delphi-guid-run2 $INPUT
+          diff -r /tmp/delphi-guid-run1 /tmp/delphi-guid-run2
+
+          # Also verify GUIDs are non-empty (grep for the GUID attribute pattern)
+          grep -qP "^\s+\['\{[0-9A-F]{8}-[0-9A-F]{4}-8[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}\}'\]" \
+            /tmp/delphi-guid-run1/UuidV8Test.pas \
+            && echo "UUIDv8 GUIDs found in output" \
+            || { echo "ERROR: No UUIDv8 GUIDs found in Delphi output"; exit 1; }
+
+          # Verify that Point and PointReversed have DIFFERENT GUIDs (field-order sensitivity)
+          POINT_GUID=$(grep -A1 "IPoint = interface" /tmp/delphi-guid-run1/UuidV8Test.pas | grep "^\s*\['" | tr -d ' ')
+          POINTREV_GUID=$(grep -A1 "IPointReversed = interface" /tmp/delphi-guid-run1/UuidV8Test.pas | grep "^\s*\['" | tr -d ' ')
+          [ "$POINT_GUID" != "$POINTREV_GUID" ] \
+            && echo "Field-order sensitivity OK (Point vs PointReversed GUIDs differ)" \
+            || { echo "ERROR: Point and PointReversed have the same GUID — field order not hashed"; exit 1; }
+
+          # Verify that BaseService and ExtendedService have DIFFERENT GUIDs (parent hash included)
+          BASE_GUID=$(grep -A1 "Iface = interface$" /tmp/delphi-guid-run1/UuidV8Test.pas | grep "^\s*\['" | head -1 | tr -d ' ')
+          EXT_GUID=$(grep -A1 "Iface = interface(.*Base" /tmp/delphi-guid-run1/UuidV8Test.pas | grep "^\s*\['" | head -1 | tr -d ' ')
+          [ "$BASE_GUID" != "$EXT_GUID" ] \
+            && echo "Parent-hash inclusion OK (BaseService vs ExtendedService GUIDs differ)" \
+            || { echo "ERROR: BaseService and ExtendedService have the same GUID — parent not hashed"; exit 1; }
+
+          echo "All Delphi UUIDv8 GUID determinism tests passed."
+
+      # only upload while building ubuntu-24.04
+      - name: Archive built thrift compiler
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v7
+        with:
+          name: thrift-compiler
+          path: compiler/cpp/thrift
+          retention-days: 3
+
+  lib-go:
+    needs: compiler
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        go:
+          - '1.25'
+          - '1.26'
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -yq
+          sudo apt-get install -y --no-install-recommends $BUILD_DEPS
+
+      - name: Run bootstrap
+        run: ./bootstrap.sh
+
+      - name: Run configure
+        run: |
+          ./configure $(echo $CONFIG_ARGS_FOR_LIBS | sed 's/without-go/with-go/')
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: thrift-compiler
+          path: compiler/cpp
+
+      - name: Run thrift-compiler
+        run: |
+          chmod a+x compiler/cpp/thrift
+          compiler/cpp/thrift -version
+
+      - name: Run make for go
+        run: make -C lib/go
+
+      - name: Run make check for lib/go
+        run: make -C lib/go check
+
+      - name: Run make check for test/go
+        run: make -C test/go check
+
+      - name: Run make precross for go test
+        run: make -C test/go precross
+
+  test-windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Run Go library tests
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          # go test prints no total, so tee the verbose output and print a pass/fail count.
+          set -o pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "$TEST_FILTER" ./lib/go/... 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+          else
+            go test -v ./lib/go/... 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+          fi
+          echo "Go test summary - passed $(grep -cE '^ *--- PASS' "$RUNNER_TEMP/go-test.log"), failed $(grep -cE '^ *--- FAIL' "$RUNNER_TEMP/go-test.log"), skipped $(grep -cE '^ *--- SKIP' "$RUNNER_TEMP/go-test.log")"
+
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Pack Go module zip
+        run: |
+          # This added workflow must not ship in the module zip; upstream's own
+          # .github files do ship and stay.
+          rm -f .github/workflows/seal-build.yml
+          mkdir -p /tmp/zipper /tmp/out
+          cd /tmp/zipper
+          go mod init zipper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: "github.com/apache/thrift", Version: "v0.23.0"}
+              if err := zip.CreateFromDir(f, mv, os.Args[1]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go run . "$GITHUB_WORKSPACE" /tmp/out/v0.23.0.zip
+          unzip -l /tmp/out/v0.23.0.zip | tail -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: /tmp/out/v0.23.0.zip
+          if-no-files-found: error

@@ -17,163 +17,32 @@
 # under the License.
 #
 
-# build Apache Thrift on Travis CI - https://travis-ci.com/
+# sealed-libraries: the upstream Travis matrix runs build/docker/refresh.sh,
+# which rebuilds a giant multi-language docker image and never finishes within
+# the sealing harness budget, and none of its jobs cover the Go module.
+# This config instead runs the project's Go library suite, mirroring
+# lib/go/Makefile.am `check-local` (`go test -race ./thrift`).
+# `./lib/go/...` resolves to package lib/go/thrift (lib/go/test and
+# lib/go/test/fuzz are nested modules). One leg without and one with -race.
 
-#
-# Docker Integration
-# see: build/docker/README.md
-#
-
-sudo: required
-# https://docs.travis-ci.com/user/reference/linux
+os: linux
 dist: focal
-language: cpp
-
-services:
-  - docker
-
-install:
-  # https://docs.travis-ci.com/user/common-build-problems/#build-times-out-because-no-output-was-received
-  # adding `travis_wait` because kerl building in the docker file takes >10 min for building erlang
-  # without printing to stdout, resulting in build failures
-  - if [[ `uname` == "Linux" ]]; then travis_wait 40 build/docker/refresh.sh; fi
-
-stages:
-  - docker    # docker images
-  - thrift    # thrift build jobs
+language: minimal
 
 env:
   global:
-    - SCRIPT="cmake.sh"
-    - BUILD_ARG=""
-    - BUILD_ENV="-e CC=gcc -e CXX=g++ -e THRIFT_CROSSTEST_CONCURRENCY=4"
-    - DISTRO=ubuntu-focal
-    - BUILD_LIBS="CPP C_GLIB JAVA PYTHON TESTING TUTORIALS"  # only meaningful for CMake builds
-    - TRAVIS_BUILD_STAGE=test
-    # DOCKER_REPO (this works for all builds as a source for docker images - you can override for fork builds in your Travis settings)
-    - DOCKER_REPO="thrift/thrift-build"
-    # DOCKER_USER (provide in your Travis settings if you want to build and update docker images once, instead of on every job)
-    # DOCKER_PASS (same)
+    - GO_VERSION=1.25.0
+  jobs:
+    - GO_TEST_FLAGS=""
+    - GO_TEST_FLAGS="-race"
 
-jobs:
-  include:
-    # ========================= stage: docker =========================
-    - script: true
-      env:
-        - JOB="Docker Build ubuntu-focal 20.04 LTS"
-        - DISTRO=ubuntu-focal
-        - TRAVIS_BUILD_STAGE=docker
-    - script: true
-      env:
-        - JOB="Docker Build ubuntu-jammy 22.04 LTS"
-        - DISTRO=ubuntu-jammy
-        - TRAVIS_BUILD_STAGE=docker
-    - script: true
-      env:
-        - JOB="Docker Build ubuntu-noble 24.04 LTS"
-        - DISTRO=ubuntu-noble
-        - TRAVIS_BUILD_STAGE=docker
+install:
+  - mkdir -p "$HOME/go-dist"
+  - curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C "$HOME/go-dist"
+  - export PATH="$HOME/go-dist/go/bin:$PATH"
+  - go version
 
-    # ========================= stage: thrift =======================
-    # ------------------------- phase: cross ------------------------
-    - stage: thrift
-      script: build/docker/run.sh
-      env:
-        - JOB="Cross Language Tests (Binary Protocol)"
-        - SCRIPT="cross-test.sh"
-        - BUILD_ARG="-'(binary)'"
-
-    - stage: thrift
-      script: build/docker/run.sh
-      env:
-        - JOB="Cross Language Tests (Header, JSON Protocols)"
-        - SCRIPT="cross-test.sh"
-        - BUILD_ARG="-'(header|json)'"
-
-    - stage: thrift
-      script: build/docker/run.sh
-      env:
-        - JOB="Cross Language Tests (Compact and Multiplexed Protocols)"
-        - SCRIPT="cross-test.sh"
-        - BUILD_ARG="-'(compact|multiplexed)'"
-
-    # ------------------------- phase: sca --------------------------
-    # QA jobs for code analytics and metrics
-    - stage: thrift
-      script: build/docker/run.sh
-      env:
-        - JOB="Static Code Analysis"
-        - SCRIPT="sca.sh"
-
-    # C and C++ undefined behavior.
-    # A binary crashes if undefined behavior occurs and produces a stack trace.
-    # python is disabled, see: THRIFT-4360
-    - script: build/docker/run.sh
-      env:
-        - JOB="UBSan"
-        - SCRIPT="ubsan.sh"
-        - BUILD_ARG="--without-python --without-py3"
-
-    # ------------------------- phase: autotools --------------------
-    # TODO: Remove them once migrated to CMake
-
-    # TODO fix the missing python2 deps or get rid of python2
-    # - script: build/docker/run.sh
-    #   env:
-    #     - JOB="Autotools (Ubuntu Jammy)"
-    #     - DISTRO=ubuntu-jammy
-    #     - SCRIPT="autotools.sh"
-
-    - script: build/docker/run.sh
-      env:
-        - JOB="Autotools (Ubuntu Focal)"
-        - DISTRO=ubuntu-focal
-        - SCRIPT="autotools.sh"
-
-    # ------------------------- phase: cmake ------------------------
-    - script: build/docker/run.sh
-      env:
-        - JOB="CMake"
-        - BUILD_ARG="-DCMAKE_BUILD_TYPE=Debug"
-
-    - script: build/docker/run.sh
-      env:
-        - JOB="CMake"
-        - BUILD_ARG="-DCMAKE_BUILD_TYPE=Release"
-
-    # ------------------------- phase: dist -------------------------
-    - script: build/docker/run.sh
-      env:
-        - JOB="make dist"
-        - SCRIPT="make-dist.sh"
-
-    - script: build/docker/run.sh
-      env:
-        - JOB="Debian Packages"
-        - SCRIPT="dpkg.sh"
-
-    # ------------------------- phase: coverity ---------------------
-    # We build the coverity scan build once monthly using a travis cron job
-    - if: (env(COVERITY_SCAN_NOTIFICATION_EMAIL) IS present) AND (branch IN (master)) AND (type IN (cron))
-      script: build/docker/run.sh
-      env:
-        - JOB="Coverity Scan"
-        - SCRIPT="covscan.sh"
-
-    # ------------------------- phase: swift ------------------------
-    # We lint the podspec
-    - os: osx
-      osx_image: xcode11.3
-      language: swift
-      script:
-        - gem update cocoapods
-        - pod lib lint --allow-warnings --swift-version=5.1
-      env:
-        - JOB="pod lib lint"
-
-  ### ------------------------- phase: osx --------------------------
-  # disabled due to the time delays it imposes on build jobs
-  # - os: osx
-  #   osx_image: xcode9
-  #   script: build/docker/scripts/autotools.sh
-
+# go test prints no total, so tee the verbose output and print a pass/fail count.
+script:
+  - set -o pipefail && go test -v $GO_TEST_FLAGS ./lib/go/... 2>&1 | tee "$HOME/go-test.log"
+  - echo "Go test summary - passed $(grep -cE '^ *--- PASS' "$HOME/go-test.log"), failed $(grep -cE '^ *--- FAIL' "$HOME/go-test.log"), skipped $(grep -cE '^ *--- SKIP' "$HOME/go-test.log")"

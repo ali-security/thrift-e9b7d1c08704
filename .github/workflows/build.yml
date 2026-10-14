@@ -1,10 +1,11 @@
 name: "Build"
 
+# sealed-libraries: retired from fork dispatch. This 76-leg polyglot matrix uploads
+# artifacts that collide on basename (e.g. five compiler legs each upload `thrift`),
+# which the sealing harness cannot merge. Its compiler + lib-go jobs are replayed
+# verbatim in seal-build.yml. `workflow_call` keeps the file inert on the fork.
 on:
-  push:
-    branches: ["*"]
-  pull_request:
-    branches: ["*"]
+  workflow_call: {}
 
 env:
   BUILD_DEPS: automake bison flex git libboost-all-dev libevent-dev libssl-dev libtool make pkg-config

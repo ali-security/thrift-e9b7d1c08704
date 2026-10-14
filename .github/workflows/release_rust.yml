@@ -20,19 +20,12 @@
 name: Release Rust Packages
 
 on:
-  push:
-    tags:
-      - "*"
-  pull_request:
-    branches:
-      - master
-    paths:
-      - ".github/workflows/release_rust.yml"
   workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     if: false   # currently broken and no maintainers around -> see THRIFT-5917        
     steps:
       - uses: actions/checkout@v6
